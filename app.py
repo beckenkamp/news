@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 import os.path
 import datetime
-import html
+import atexit
 from flask import Flask, render_template, flash, redirect, url_for, request
 from flask_sqlalchemy import SQLAlchemy
 from newspaper import Article
 from slugify import slugify
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from get_urls import get_urls
 
@@ -16,6 +17,10 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:////tmp/news.db'
 app.config['SECRET_KEY'] = 'dev key'
 
 db = SQLAlchemy(app)
+cron = BackgroundScheduler()
+
+# Explicitly kick off the background thread
+cron.start()
 
 
 class News(db.Model):
@@ -36,13 +41,19 @@ class News(db.Model):
         return self.title
 
 
-@app.route('/build')
+@cron.scheduled_job('interval', id='get_news', hours=8)
 def get_news():
     urls = get_urls()
     news = News.query.with_entities(News.source_url).all()
 
+    used_urls = []
+    for n in news:
+        used_urls.append(n[0])
+
     for url in urls:
-        if url not in news:
+        if not url in used_urls:
+            used_urls.append(url)
+
             article = Article(url, language='pt', keep_article_html=True)
             article.download()
             article.parse()
@@ -57,10 +68,12 @@ def get_news():
             news_article.article_html = article.article_html
             news_article.created_at = datetime.datetime.now()
 
-            db.session.add(news_article)
-            db.session.commit()
+            exists_this_news = News.query.filter_by(source_url=url).first()
 
-    return redirect(url_for('show_news'))
+            if not exists_this_news:
+                print(url)
+                db.session.add(news_article)
+                db.session.commit()
 
 
 @app.route('/')
@@ -74,6 +87,9 @@ def show_article(slug):
     article = News.query.filter_by(slug=slug).first()
     return render_template('detail.html', article=article)
 
+
+# Shutdown your cron thread if the web process is stopped
+atexit.register(lambda: cron.shutdown(wait=False))
 
 if __name__ == '__main__':
     if not os.path.isfile(app.config['SQLALCHEMY_DATABASE_URI']):
